@@ -22,6 +22,8 @@ class ModelArgs:
     norm_eps: float = 1e-5
     max_seq_len: int = 2048
     dropout: float = 0.0
+    mtp_lambda: float = 1.0
+    mtp_tokens: int = 0
 
 
 class RMSNorm(torch.nn.Module):
@@ -219,6 +221,11 @@ class Transformer(nn.Module):
             self.layers.append(TransformerBlock(layer_id, params))
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
         self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
+        self.mtp_lambda = params.mtp_lambda
+        self.mtp_out = torch.nn.ModuleList()
+        for layer_id in range(params.mtp_tokens):
+            self.mtp_out.append(nn.Linear(params.dim, params.vocab_size, bias=False))
+
 
         # share the unembedding parameters with the embedding parameters
         self.tok_embeddings.weight = self.output.weight # https://paperswithcode.com/method/weight-tying
@@ -237,6 +244,7 @@ class Transformer(nn.Module):
 
         # Initialize attribute for the loss of the last forward call. This will be set if the forward is called with a targets tensor.
         self.last_loss = None
+        self.report_loss = None
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -260,11 +268,23 @@ class Transformer(nn.Module):
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.output(h)
-            self.last_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            self.last_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets[:, 0, :].reshape(-1),
+                ignore_index=-1)
+            self.report_loss = self.last_loss.item()
+
+            if self.mtp_out:
+                mtp_losses = torch.zeros(len(self.mtp_out), device=logits.device)
+                for i, head in enumerate(self.mtp_out):
+                    mtp_logits = head(h)
+                    mtp_losses[i] = F.cross_entropy(mtp_logits.view(-1, logits.size(-1)), targets[:, i + 1, :].reshape(-1),
+                        ignore_index=-1)
+
+                self.last_loss += self.mtp_lambda * mtp_losses.mean()
         else:
             # inference-time mini-optimization: only forward the output on the very last position
             logits = self.output(h[:, [-1], :]) # note: using list [-1] to preserve the time dim
             self.last_loss = None
+            self.report_loss = None
 
         return logits
 

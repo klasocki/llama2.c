@@ -11,7 +11,7 @@ from tokenizer import Tokenizer
 from tinystories import get_tokenizer_model_path
 
 # -----------------------------------------------------------------------------
-checkpoint = 'out/ckpt.pt'
+checkpoint = 'outmini/ckpt.pt'
 start = "" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
 num_samples = 1 # number of samples to draw
 max_new_tokens = 100 # number of tokens generated in each sample

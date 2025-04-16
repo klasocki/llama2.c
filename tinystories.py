@@ -27,11 +27,11 @@ def download_file(url: str, fname: str, chunk_size=1024):
     resp = requests.get(url, stream=True)
     total = int(resp.headers.get("content-length", 0))
     with open(fname, "wb") as file, tqdm(
-        desc=fname,
-        total=total,
-        unit="iB",
-        unit_scale=True,
-        unit_divisor=1024,
+            desc=fname,
+            total=total,
+            unit="iB",
+            unit_scale=True,
+            unit_divisor=1024,
     ) as bar:
         for data in resp.iter_content(chunk_size=chunk_size):
             size = file.write(data)
@@ -68,6 +68,7 @@ def download():
     print(f"Number of shards: {len(shard_filenames)}")
     print(f"Example story:\n{data[0]}")
 
+
 def train_vocab(vocab_size):
     """
     Trains a custom sentencepiece tokenizer on the TinyStories dataset.
@@ -100,19 +101,21 @@ def train_vocab(vocab_size):
 
     # 2) train the sentencepiece model
     print("Will now train the vocab...")
-    spm.SentencePieceTrainer.train(input=tiny_file,
-                                   model_prefix=prefix,
-                                   model_type="bpe",
-                                   vocab_size=vocab_size,
-                                   self_test_sample_size=0,
-                                   input_format="text",
-                                   character_coverage=1.0,
-                                   num_threads=os.cpu_count(),
-                                   split_digits=True,
-                                   allow_whitespace_only_pieces=True,
-                                   byte_fallback=True,
-                                   unk_surface=r" \342\201\207 ",
-                                   normalization_rule_name="identity")
+    spm.SentencePieceTrainer.train(
+        input=tiny_file,
+        model_prefix=prefix,
+        model_type="bpe",
+        vocab_size=vocab_size,
+        self_test_sample_size=0,
+        input_format="text",
+        character_coverage=1.0,
+        num_threads=os.cpu_count(),
+        split_digits=True,
+        allow_whitespace_only_pieces=True,
+        byte_fallback=True,
+        unk_surface=r" \342\201\207 ",
+        normalization_rule_name="identity"
+    )
 
     # 3) optional cleanup, ask the user if they'd like to delete tiny.txt
     dec = input(f"Delete the temporary file {tiny_file}? [y/N] ")
@@ -175,12 +178,13 @@ def pretokenize(vocab_size):
 class PretokDataset(torch.utils.data.IterableDataset):
     """Loads pretokenized examples from disk and yields them as PyTorch tensors."""
 
-    def __init__(self, split, max_seq_len, vocab_size, vocab_source):
+    def __init__(self, split, max_seq_len, vocab_size, vocab_source, mtp_tokens=0):
         super().__init__()
         self.split = split
         self.max_seq_len = max_seq_len
         self.vocab_size = vocab_size
         self.vocab_source = vocab_source
+        self.mtp_tokens = mtp_tokens
 
     def __iter__(self):
         # get worker info within a DataLoader
@@ -202,7 +206,7 @@ class PretokDataset(torch.utils.data.IterableDataset):
             shard_filenames = sorted(glob.glob(os.path.join(bin_dir, "*.bin")))
         # train/test split. let's use only shard 0 for test split, rest train
         shard_filenames = shard_filenames[1:] if self.split == "train" else shard_filenames[:1]
-        assert len(shard_filenames)>0, f"No bin files found in {bin_dir}"
+        assert len(shard_filenames) > 0, f"No bin files found in {bin_dir}"
         while True:
             rng.shuffle(shard_filenames)
             for shard in shard_filenames:
@@ -218,9 +222,15 @@ class PretokDataset(torch.utils.data.IterableDataset):
                     end = start + self.max_seq_len + 1
                     # calling .astype will copy the data into a new numpy array, now in RAM
                     chunk = torch.from_numpy((m[start:end]).astype(np.int64))
-                    x = chunk[:-1]
-                    y = chunk[1:]
+                    x = chunk[:-(self.mtp_tokens + 1)]
+                    y = torch.stack(
+                        [chunk[(1 + i):(-(self.mtp_tokens - i)) if not i == self.mtp_tokens else None] for i
+                            in range(
+                            self.mtp_tokens + 1
+                        )]
+                    )
                     yield x, y
+
 
 # -----------------------------------------------------------------------------
 # public interface functions
@@ -236,6 +246,7 @@ def get_tokenizer_model_path(vocab_size):
     else:
         return os.path.join(DATA_CACHE_DIR, f"tok{vocab_size}.model")
 
+
 class Task:
 
     @staticmethod
@@ -248,6 +259,7 @@ class Task:
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
             yield x, y
+
 
 # -----------------------------------------------------------------------------
 # CLI for constructing the dataset
@@ -267,7 +279,9 @@ if __name__ == "__main__":
     """
     parser = argparse.ArgumentParser()
     parser.add_argument("stage", type=str, choices=["download", "pretokenize", "train_vocab"])
-    parser.add_argument("--vocab_size", type=int, default=0, help="pretokenization vocab size. 0 = use Llama 2 tokenizer.")
+    parser.add_argument(
+        "--vocab_size", type=int, default=0, help="pretokenization vocab size. 0 = use Llama 2 tokenizer."
+    )
     args = parser.parse_args()
 
     # depending on the stage call the appropriate function

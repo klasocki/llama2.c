@@ -56,6 +56,8 @@ n_heads = 6
 n_kv_heads = 6
 multiple_of = 32
 dropout = 0.0
+mtp_lambda = 1.0
+mtp_tokens = 5
 # adamw optimizer
 gradient_accumulation_steps = 4  # used to simulate larger batch sizes
 learning_rate = 5e-4  # max learning rate
@@ -68,7 +70,7 @@ grad_clip = 1.0  # clip gradients at this value, or disable if == 0.0
 decay_lr = True  # whether to decay the learning rate
 warmup_iters = 1000  # how many steps to warm up for
 # system
-device = "cuda"  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
+device = "cpu"  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = "bfloat16"  # float32|bfloat16|float16
 compile = True  # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
@@ -137,6 +139,7 @@ iter_batches = partial(
     vocab_source=vocab_source,
     device=device,
     num_workers=0,
+    mtp_tokens=mtp_tokens
 )
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
@@ -153,6 +156,8 @@ model_args = dict(
     multiple_of=multiple_of,
     max_seq_len=max_seq_len,
     dropout=dropout,
+    mtp_lambda=mtp_lambda,
+    mtp_tokens=mtp_tokens,
 )  # start with model_args from command line
 if init_from == "scratch":
     # init a new model from scratch
@@ -219,8 +224,8 @@ def estimate_loss():
             X, Y = next(batch_iter)
             with ctx:
                 logits = model(X, Y)
-                loss = raw_model.last_loss
-            losses[k] = loss.item()
+                loss = raw_model.report_loss
+            losses[k] = loss
         out[split] = losses.mean()
     model.train()
     return out
@@ -248,6 +253,7 @@ if wandb_log and master_process:
 train_batch_iter = iter_batches(split="train")
 X, Y = next(train_batch_iter)  # fetch the very first batch
 t0 = time.time()
+start_time = t0
 local_iter_num = 0  # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model  # unwrap DDP container if needed
 running_mfu = -1.0
@@ -325,12 +331,16 @@ while True:
     t0 = t1
     if iter_num % log_interval == 0 and master_process:
         # get loss as float, scale up due to the divide above. note: this is a CPU-GPU sync point
-        lossf = loss.item() * gradient_accumulation_steps
+        lossf = raw_model.report_loss
+        train_loss = raw_model.last_loss.item()
         if local_iter_num >= 5:  # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
         print(
-            f"{iter_num} | loss {lossf:.4f} | lr {lr:e} | {dt*1000:.2f}ms | mfu {running_mfu*100:.2f}%"
+            f"{iter_num} | next_token_loss {lossf:.4f} | full_loss {train_loss:.4f} | lr {lr:e} | elapsed "
+            f"{(t1 - start_time):.2f}s |"
+            f" {dt*1000:.2f}ms | mfu"
+            f" {running_mfu*100:.2f}%"
         )
     iter_num += 1
     local_iter_num += 1
