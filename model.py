@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+
 @dataclass
 class ModelArgs:
     # default hyperparameters for the Llama 7B model
@@ -48,6 +49,7 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     freqs_sin = torch.sin(freqs)  # imaginary part
     return freqs_cos, freqs_sin
 
+
 def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     ndim = x.ndim
     assert 0 <= 1 < ndim
@@ -55,13 +57,13 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
     return freqs_cis.view(shape)
 
-def apply_rotary_emb(
-    xq: torch.Tensor,
-    xk: torch.Tensor,
-    freqs_cos: torch.Tensor,
-    freqs_sin: torch.Tensor
-) -> Tuple[torch.Tensor, torch.Tensor]:
 
+def apply_rotary_emb(
+        xq: torch.Tensor,
+        xk: torch.Tensor,
+        freqs_cos: torch.Tensor,
+        freqs_sin: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
     # reshape xq and xk to match the complex representation
     xq_r, xq_i = xq.float().reshape(xq.shape[:-1] + (-1, 2)).unbind(-1)
     xk_r, xk_i = xk.float().reshape(xk.shape[:-1] + (-1, 2)).unbind(-1)
@@ -82,6 +84,7 @@ def apply_rotary_emb(
 
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
+
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
     bs, slen, n_kv_heads, head_dim = x.shape
@@ -92,6 +95,7 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
         .expand(bs, slen, n_kv_heads, n_rep, head_dim)
         .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
     )
+
 
 class Attention(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -120,10 +124,10 @@ class Attention(nn.Module):
             self.register_buffer("mask", mask)
 
     def forward(
-        self,
-        x: torch.Tensor,
-        freqs_cos: torch.Tensor,
-        freqs_sin: torch.Tensor,
+            self,
+            x: torch.Tensor,
+            freqs_cos: torch.Tensor,
+            freqs_sin: torch.Tensor,
     ):
         bsz, seqlen, _ = x.shape
 
@@ -147,12 +151,14 @@ class Attention(nn.Module):
 
         # flash implementation
         if self.flash:
-            output = torch.nn.functional.scaled_dot_product_attention(xq, xk, xv, attn_mask=None, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
+            output = torch.nn.functional.scaled_dot_product_attention(
+                xq, xk, xv, attn_mask=None, dropout_p=self.dropout if self.training else 0.0, is_causal=True
+            )
         else:
             # manual implementation
             scores = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.head_dim)
             assert hasattr(self, 'mask')
-            scores = scores + self.mask[:, :, :seqlen, :seqlen]   # (bs, n_local_heads, seqlen, cache_len + seqlen)
+            scores = scores + self.mask[:, :, :seqlen, :seqlen]  # (bs, n_local_heads, seqlen, cache_len + seqlen)
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
             scores = self.attn_dropout(scores)
             output = torch.matmul(scores, xv)  # (bs, n_local_heads, seqlen, head_dim)
@@ -226,9 +232,8 @@ class Transformer(nn.Module):
         for layer_id in range(params.mtp_tokens):
             self.mtp_out.append(nn.Linear(params.dim, params.vocab_size, bias=False))
 
-
         # share the unembedding parameters with the embedding parameters
-        self.tok_embeddings.weight = self.output.weight # https://paperswithcode.com/method/weight-tying
+        self.tok_embeddings.weight = self.output.weight  # https://paperswithcode.com/method/weight-tying
 
         # some useful precompute for the RoPE relative positional embeddings
         freqs_cos, freqs_sin = precompute_freqs_cis(self.params.dim // self.params.n_heads, self.params.max_seq_len)
@@ -240,7 +245,7 @@ class Transformer(nn.Module):
         # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
             if pn.endswith('w3.weight') or pn.endswith('wo.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * params.n_layers))
+                torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * params.n_layers))
 
         # Initialize attribute for the loss of the last forward call. This will be set if the forward is called with a targets tensor.
         self.last_loss = None
@@ -267,22 +272,37 @@ class Transformer(nn.Module):
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
-            logits = self.output(h)
-            self.last_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets[:, 0, :].reshape(-1),
-                ignore_index=-1)
+            if self.training:
+                # TODO doing backward inside forward is probably not the best idea, and it breaks gradient_accumulation
+                # and loss scaling, but for this experiment it works and was the quickest to implement.
+                d = h.detach()
+                d.requires_grad = True
+            else:
+                d = h
+
+            logits = self.output(d)
+            self.last_loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)), targets[:, 0, :].reshape(-1),
+                ignore_index=-1
+            )
             self.report_loss = self.last_loss.item()
+            if self.training:
+                self.last_loss.backward()
 
-            if self.mtp_out:
-                mtp_losses = torch.zeros(len(self.mtp_out), device=logits.device)
+            if self.mtp_out and self.training:
                 for i, head in enumerate(self.mtp_out):
-                    mtp_logits = head(h)
-                    mtp_losses[i] = F.cross_entropy(mtp_logits.view(-1, logits.size(-1)), targets[:, i + 1, :].reshape(-1),
-                        ignore_index=-1)
-
-                self.last_loss += self.mtp_lambda * mtp_losses.mean()
+                    mtp_logits = head(d)
+                    mtp_loss = F.cross_entropy(
+                        mtp_logits.view(-1, logits.size(-1)), targets[:, i + 1, :].reshape(-1),
+                        ignore_index=-1
+                    ) * self.mtp_lambda / len(self.mtp_out)
+                    mtp_loss.backward()
+                    self.last_loss += mtp_loss
+            if self.training:
+                h.backward(gradient=d.grad)
         else:
             # inference-time mini-optimization: only forward the output on the very last position
-            logits = self.output(h[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            logits = self.output(h[:, [-1], :])  # note: using list [-1] to preserve the time dim
             self.last_loss = None
             self.report_loss = None
 
@@ -320,13 +340,13 @@ class Transformer(nn.Module):
         # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
         N = sum(p.numel() for p in self.parameters())
         cfg = self.params
-        L, H, Q, T = cfg.n_layers, cfg.n_heads, cfg.dim//cfg.n_heads, cfg.max_seq_len
-        flops_per_token = 6*N + 12*L*H*Q*T
+        L, H, Q, T = cfg.n_layers, cfg.n_heads, cfg.dim // cfg.n_heads, cfg.max_seq_len
+        flops_per_token = 6 * N + 12 * L * H * Q * T
         flops_per_fwdbwd = flops_per_token * T
         flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
         # express our flops throughput as ratio of A100 bfloat16 peak flops
-        flops_achieved = flops_per_iter * (1.0/dt) # per second
-        flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
+        flops_achieved = flops_per_iter * (1.0 / dt)  # per second
+        flops_promised = 312e12  # A100 GPU bfloat16 peak flops is 312 TFLOPS
         mfu = flops_achieved / flops_promised
         return mfu
 
@@ -343,7 +363,7 @@ class Transformer(nn.Module):
             idx_cond = idx if idx.size(1) <= self.params.max_seq_len else idx[:, -self.params.max_seq_len:]
             # forward the model to get the logits for the index in the sequence
             logits = self(idx_cond)
-            logits = logits[:, -1, :] # crop to just the final time step
+            logits = logits[:, -1, :]  # crop to just the final time step
             if temperature == 0.0:
                 # "sample" the single most likely index
                 _, idx_next = torch.topk(logits, k=1, dim=-1)

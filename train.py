@@ -314,7 +314,7 @@ while True:
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = next(train_batch_iter)
         # backward pass, with gradient scaling if training in fp16
-        scaler.scale(loss).backward()
+        scaler.scale(loss)#.backward()
     # clip the gradient
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
