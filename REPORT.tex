@@ -1,0 +1,153 @@
+\documentclass[10pt]{article}
+\usepackage{amsmath, amssymb}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{natbib}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage[margin=0.75in]{geometry}
+\usepackage{float}
+\usepackage{titlesec}
+
+% Reduce spacing
+\setlength{\parskip}{0.5ex}
+\setlength{\parindent}{0em}
+\titlespacing*{\section}{0pt}{1.5ex plus 0.5ex minus 0.2ex}{0.8ex plus 0.2ex}
+\titlespacing*{\subsection}{0pt}{1.2ex plus 0.5ex minus 0.2ex}{0.6ex plus 0.2ex}
+
+\title{\vspace{-1.5cm}Adding MTP Objective to Training}
+\author{Karol Lasocki}
+\date{\vspace{-1.5cm}}
+
+\begin{document}
+
+\maketitle
+
+% Compact lists and equations
+\setlength{\abovedisplayskip}{3pt}
+\setlength{\belowdisplayskip}{3pt}
+\setlength{\abovedisplayshortskip}{1pt}
+\setlength{\belowdisplayshortskip}{1pt}
+\setlength{\itemsep}{0pt}
+\setlength{\parsep}{0pt}
+\setlength{\topsep}{1pt}
+
+\section{Implementation}
+
+
+Since vocab size is rather big, I followed \citet{gloeckle2024} in reordering the forward and backward passes, so that we do not have to store gradients for all the heads separately, but rather accumulate their gradients in the final transformer embedding, releasing the memory and only doing the final backward pass at the end.
+
+Other than that, I AI-generated the \texttt{plot\_losses.py}, which compares different model runs based on training log files.
+
+Here is the command I used to run the training, for the baseline I used \texttt{mtp\_tokens=0} instead:
+{\small
+\begin{verbatim}
+python train.py --out_dir="outmini" --batch_size=4 --max_seq_len=512 --gradient_accumulation_steps=1
+--dim=64 --n_layers=5 --n_heads=8 --n_kv_heads=4 --multiple_of=4 --learning_rate=1e-3
+--dropout=0.05 --weight_decay=0.01 --max_iters=700 --beta2=0.99 --warmup_iters=200
+--eval_interval=50 --eval_iters=100 --compile=False --mtp_tokens=3 --mtp_lambda=0.5
+\end{verbatim}
+}
+
+\section{Results}
+
+The results are actually not great, but it is expected for this experiment. According to \citet{gloeckle2024}, MTP is only beneficial for bigger models (3B+ parameters). Intuitively, what I think is happening with the 2 main benefits of MTP is:
+\begin{itemize}[leftmargin=*,itemsep=0pt,topsep=0pt,parsep=0pt]
+    \item \textbf{Densifying the training signal} - the 260k model is not big enough to properly utilize the additional gradients, and it gets distracted from its primary objective of next token prediction.
+    \item \textbf{Pre-planning the future tokens} - again the model is too small, and we are too early in the training process for the model to be able to benefit from this ability.
+\end{itemize}
+
+Moreover, in the experiment we add 3 additional heads, each of size $\text{dim} \times \text{vocab\_size}$, resulting in $3 \times 64 \times 32000 = 6,144,000$ extra parameters. These 6M extra params is actually 2.7x more than the 2.3M the model originally had (for the actual 260k model we'd need \texttt{vocab\_size=512}), completely dominating the attention blocks. Therefore, training with MTP actually converges much slower in terms of elapsed time, and the real benefit from it can be seen in 1B+ models, where the added parameter counts become negligible.
+
+See the loss plots in Appendix A.
+
+\section{Future Ideas}
+
+While at the current scale it is hard to prove the benefits, I had the following ideas in mind for accelerating training convergence:
+
+\subsection{Beyond MTP for Auxiliary Tasks}
+
+I cannot see why we should stop at MTP for the auxiliary task.
+
+Well, I actually can, because it is easy to self-supervise data for it. However, preprocessing of the dataset is a different cost than the training cost, since we can train multiple models on the same data. These days we have LLMs that are sometimes more powerful than human annotators, so we can use them to get additional labels for each token to predict.
+
+We could add classic NLP tasks as secondary objectives, such as sentiment analysis, NER, sentence parsing, etc. It would kinda combine the ideas of:
+\begin{enumerate}[leftmargin=*,itemsep=0pt,topsep=0pt,parsep=0pt]
+    \item model distillation, if we use a bigger LLM to label data for a smaller model, or for a new version of itself which can converge faster thanks to those labels;
+    \item curriculum learning, similar to how kids in school first learn to recognise names, numbers and parts of speech, before learning math, foreign languages etc.;
+    \item representation learning - same principle as for skip gram models, it does not matter if it is even possible to predict all these things at once, it will still push the internal representation to be better.
+\end{enumerate}
+
+Thanks to how derivatives of sums work, we can just add up all those auxiliary losses, trying to push the model in all these directions simultaneously. Could experiment with discarding those heads and losses after the warmup or some steps, to not distract the model from fact learning etc.- again just like kids at school stop learning these basics at some point.
+
+\subsection{Soft Targets Instead of One-Hot Encoding}
+
+Another distillation idea - I do not like that the models are equally penalized for mistakes where the predicted token completely does not make sense, and when it would simply be a valid second choice in the position.
+
+I think it can be confusing especially at the start of training (one could argue that for a full training run the aggregate gradient updates will still approach the same weights) and slow down convergence. Instead of using one-hot encoded labels, we can create a more nuanced target distribution that reflects the relative acceptability of different tokens. Mathematically, this can be formulated as follows:
+
+Let $t$ be the ground truth token and $p(t)$ be its probability according to a strong reference LLM. We define a set of acceptable tokens $A$ as:
+
+\begin{equation}
+A = \{t' \in V \mid p(t') \in [0.8 \cdot p(t), 1.2 \cdot p(t)]\}
+\end{equation}
+
+where $V$ is the vocabulary. Using an upper-range limit is debatable. We then create modified logits $l'$ as:
+
+\begin{equation}
+l'(t') =
+\begin{cases}
+l(t) + B & \text{if } t' = t\\
+l(t') & \text{if } t' \in A \\
+-inf & \text{otherwise}
+\end{cases}
+\end{equation}
+
+where:
+\begin{itemize}[leftmargin=*,itemsep=0pt,topsep=0pt,parsep=0pt]
+    \item $l(t')$ is the logit of token $t'$ from the reference LLM
+    \item $B$ is a bias term added to the ground truth token to ensure it remains the most likely
+\end{itemize}
+
+These logits are then softmaxed and used in place of the one-hot encoded label in the cross-entropy loss:
+
+\begin{equation}
+\mathcal{L} = -\sum_{t' \in V} q(t') \log(p_\theta(t'))
+\end{equation}
+
+where $p_\theta$ is the probability distribution produced by our model with parameters $\theta$, and $q$ is the resulting softmax distribution.
+
+This approach could help teach the model faster that some mistakes are more costly than others, and work well for increasing sampling variance - though it is debatable whether we want it, e.g. for code.
+
+\subsection{Additional Ideas}
+
+\begin{itemize}[leftmargin=*,itemsep=0pt,topsep=0pt,parsep=0pt]
+    \item \textbf{Curriculum learning} in its classic form would be good to try too, ordering training data according to perplexity from a stronger model, or some heuristic for story complexity.
+    \item Following DeepSeekv3, a more complex sequential MTP attention block could allow the model to predict multiple tokens more accurately, although it is not applicable for the '260k' model. Also multi-head latent attention could help for faster training convergence, since they claim it achieves better results with less parameters.
+    \item Personally I believe in 1.58 bit models, I think ternary decisions instead of float weights have a big potential for making LLMs more efficient.
+\end{itemize}
+
+Less than an idea and more of a TODO - the current implementation of gradient accumulation for MTP tokens breaks the standard gradient accumulation and loss scaling for fp16 training. I did not use either in the experiment, so the results should be correct, but it should be implemented more carefully in a real system.
+
+\clearpage
+\appendix
+\section{Loss Plots}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{loss_plots.png}
+    \caption{Loss plots comparing training and validation losses}
+    \label{fig:loss_plots}
+\end{figure}
+
+\bibliographystyle{plainnat}
+\begin{thebibliography}{1}
+
+\bibitem[Gloeckle et al.(2024)]{gloeckle2024}
+Gloeckle, F., Youbi Idrissi, B., Rozière, B., Lopez-Paz, D., and Synnaeve, G. (2024).
+\newblock Better \& Faster Large Language Models via Multi-token Prediction.
+\newblock \textit{arXiv preprint arXiv:2404.19737}. Available at: \url{https://arxiv.org/abs/2404.19737}
+
+\end{thebibliography}
+
+\end{document}
